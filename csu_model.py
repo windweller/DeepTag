@@ -140,39 +140,14 @@ class Classifier(nn.Module):
         super(Classifier, self).__init__()
         self.config = config
         self.drop = nn.Dropout(config.dropout)  # embedding dropout
-        if config.conv_enc == 1:
-            kernel_size = config.hidden_size / 8
-            print(kernel_size)
-            self.encoder = ConvNetEncoder({
-                'word_emb_dim': config.emb_dim,
-                'enc_lstm_dim': kernel_size if not config.bidir else kernel_size * 2
-            })
-            d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
-        elif config.conv_enc == 2:
-            kernel_size = config.hidden_size
-            print(kernel_size)
-            self.encoder = NormalConvNetEncoder({
-                'word_emb_dim': config.emb_dim,
-                'enc_lstm_dim': kernel_size if not config.bidir else kernel_size * 2
-            })
-            d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
-        elif config.conv_enc == 3:
-            kernel_num = config.hidden_size / 3
-            kernel_num = kernel_num if not config.bidir else kernel_num * 2
-            self.encoder = CNN_Text_Encoder({
-                'word_emb_dim': config.emb_dim,
-                'kernel_sizes': [3,4,5],
-                'kernel_num': kernel_num
-            })
-            d_out = len([3,4,5]) * kernel_num
-        else:
-            self.encoder = nn.LSTM(
-                config.emb_dim,
-                config.hidden_size,
-                config.depth,
-                dropout=config.dropout,
-                bidirectional=config.bidir)  # ha...not even bidirectional
-            d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
+        
+        self.encoder = nn.LSTM(
+            config.emb_dim,
+            config.hidden_size,
+            config.depth,
+            dropout=config.dropout,
+            bidirectional=config.bidir)  # ha...not even bidirectional
+        d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
 
         self.out = nn.Linear(d_out, config.label_size)  # include bias, to prevent bias assignment
         self.embed = nn.Embedding(len(vocab), config.emb_dim)
@@ -1217,8 +1192,8 @@ class Experiment(object):
 # otherwise the sampling procedure will be different
 def run_baseline(device):
     random.setstate(orig_state)
-    lstm_base_c = LSTMBaseConfig(emb_corpus=emb_corpus, avg_run_times=avg_run_times,
-                                 conv_enc=use_conv)
+    lstm_base_c = LSTMBaseConfig(emb_corpus=emb_corpus, avg_run_times=avg_run_times
+                                 )
     curr_exp.execute(lstm_base_c, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=lstm_base_c, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
@@ -1226,8 +1201,8 @@ def run_baseline(device):
 
 def run_bidir_baseline(device):
     random.setstate(orig_state)
-    lstm_bidir_c = LSTMBaseConfig(bidir=True, emb_corpus=emb_corpus, avg_run_times=avg_run_times,
-                                  conv_enc=use_conv)
+    lstm_bidir_c = LSTMBaseConfig(bidir=True, emb_corpus=emb_corpus, avg_run_times=avg_run_times
+                                  )
     curr_exp.execute(lstm_bidir_c, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=lstm_bidir_c, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
@@ -1235,8 +1210,8 @@ def run_bidir_baseline(device):
 
 def run_m_penalty(device, beta=1e-3, bidir=False):
     random.setstate(orig_state)
-    config = LSTM_w_M_Config(beta, bidir=bidir, emb_corpus=emb_corpus, avg_run_times=avg_run_times,
-                             conv_enc=use_conv)
+    config = LSTM_w_M_Config(beta, bidir=bidir, emb_corpus=emb_corpus, avg_run_times=avg_run_times
+                             )
     curr_exp.execute(config, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=config, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
@@ -1245,7 +1220,7 @@ def run_m_penalty(device, beta=1e-3, bidir=False):
 def run_c_penalty(device, sigma_M, sigma_B, sigma_W, bidir=False):
     random.setstate(orig_state)
     config = LSTM_w_C_Config(sigma_M, sigma_B, sigma_W, bidir=bidir, emb_corpus=emb_corpus,
-                             avg_run_times=avg_run_times, conv_enc=use_conv)
+                             avg_run_times=avg_run_times)
     curr_exp.execute(config, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=config, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
@@ -1288,12 +1263,6 @@ if __name__ == '__main__':
         dataset_prefix = 'snomed_revised_fields_multi_label_no_des_'
     elif int(dataset_number) == 3:
         dataset_prefix = 'snomed_all_fields_multi_label_no_des_'
-
-    conv_encoder = raw_input("Use conv_encoder or not? 0/1(Hierarchical)/2(Normal)/3(TextCNN) \n")
-    assert (conv_encoder == '0' or conv_encoder == '1' or conv_encoder == '2' or conv_encoder == '3')
-
-    global use_conv
-    use_conv = int(conv_encoder.strip())
 
     train_epochs = raw_input("Enter the number of training epochs: (default 5) \n")
     if train_epochs.strip() == "":

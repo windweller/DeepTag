@@ -10,3 +10,5 @@ However, we are able to share our experiment framework code. Note the randomness
 `csu_data.py` preprocesses the data.
 
 `Learning_to_Reject.ipynb` is the Jupyter Notebook that we used to compute the abstention algorithm. It loads in previously saved output from a trained classifier, and use it to train a new abstention model. The plots in the paper are generated from this notebook.
+
+`data/snomed_label_to_meta_grouping.json` contains the label (disease) similarity that we defined. We hope this list to be of general value to people working with SNOMED-CT disease level codes.

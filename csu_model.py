@@ -11,6 +11,7 @@ import math
 from sklearn import metrics
 from scipy import stats
 from os.path import join as pjoin
+from scipy.special import expit as sigmoid
 
 from collections import defaultdict
 from itertools import combinations, izip
@@ -97,11 +98,13 @@ class Config(dict):
 # each config is used to build a classifier and a trainer, so one for each
 class LSTMBaseConfig(Config):
     def __init__(self, emb_dim=100, hidden_size=512, depth=1, label_size=42, bidir=False,
-                 c=False, m=False, dropout=0.2, emb_update=True, clip_grad=5., seed=1234,
+                 c=False, m=False, co=False,
+                 dropout=0.2, emb_update=True, clip_grad=5., seed=1234,
                  rand_unk=True, run_name="default", emb_corpus="gigaword", avg_run_times=1,
-                 conv_enc=False,
+                 conv_enc=0,
                  **kwargs):
         # run_name: the folder for the trainer
+        # c: cluster, m: meta, co: co-occurence constraint
         super(LSTMBaseConfig, self).__init__(emb_dim=emb_dim,
                                              hidden_size=hidden_size,
                                              depth=depth,
@@ -109,6 +112,7 @@ class LSTMBaseConfig(Config):
                                              bidir=bidir,
                                              c=c,
                                              m=m,
+                                             co=co,
                                              dropout=dropout,
                                              emb_update=emb_update,
                                              clip_grad=clip_grad,
@@ -133,21 +137,220 @@ class LSTM_w_C_Config(LSTMBaseConfig):
 class LSTM_w_M_Config(LSTMBaseConfig):
     def __init__(self, beta, **kwargs):
         super(LSTM_w_M_Config, self).__init__(beta=beta, m=True, **kwargs)
-        
+
+
+class LSTM_w_Co_config(LSTMBaseConfig):
+    def __init__(self, x_max=100, alpha=0.75, gamma=1e-3, use_csu=True,
+                 use_pp=False, glove=False, ppmi=False,
+                 **kwargs):
+        """
+        :param x_max:  int (default: 100)
+                Words with frequency greater than this are given weight 1.0.
+                Words with frequency under this are given weight (c/xmax)**alpha
+                where c is their count in mat (see the paper, eq. (9)).
+        :param alpha: float (default: 0.75)
+                Exponent in the weighting function (see the paper, eq. (9)).
+        :param gamma: float(default=1e-3)
+                The strength of this penalty
+        :param use_csu: use co-occurence frequency from CSU
+        :param use_pp: use co-occurence frequency from PP
+        :param glove: use GlOVE style loss, otherwise
+        :param ppmi: we want this to be false because if it's negative, then we want that too
+        :param kwargs:
+        """
+        super(LSTM_w_Co_config, self).__init__(co=True,
+                                               x_max=x_max,
+                                               alpha=alpha,
+                                               gamma=gamma,
+                                               use_csu=use_csu,
+                                               use_pp=use_pp,
+                                               glove=glove,
+                                               ppmi=ppmi,
+                                               **kwargs)
+
+
+"""
+Hierarchical ConvNet
+"""
+
+
+class ConvNetEncoder(nn.Module):
+    def __init__(self, config):
+        super(ConvNetEncoder, self).__init__()
+
+        self.word_emb_dim = config['word_emb_dim']
+        self.enc_lstm_dim = config['enc_lstm_dim']
+
+        self.convnet1 = nn.Sequential(
+            nn.Conv1d(self.word_emb_dim, 2 * self.enc_lstm_dim, kernel_size=3,
+                      stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.convnet2 = nn.Sequential(
+            nn.Conv1d(2 * self.enc_lstm_dim, 2 * self.enc_lstm_dim, kernel_size=3,
+                      stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.convnet3 = nn.Sequential(
+            nn.Conv1d(2 * self.enc_lstm_dim, 2 * self.enc_lstm_dim, kernel_size=3,
+                      stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.convnet4 = nn.Sequential(
+            nn.Conv1d(2 * self.enc_lstm_dim, 2 * self.enc_lstm_dim, kernel_size=3,
+                      stride=1, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, sent_tuple):
+        # sent_len: [max_len, ..., min_len] (batch)
+        # sent: Variable(seqlen x batch x worddim)
+
+        sent, sent_len = sent_tuple
+
+        sent = sent.transpose(0, 1).transpose(1, 2).contiguous()
+        # batch, nhid, seqlen)
+
+        sent = self.convnet1(sent)
+        u1 = torch.max(sent, 2)[0]
+
+        sent = self.convnet2(sent)
+        u2 = torch.max(sent, 2)[0]
+
+        sent = self.convnet3(sent)
+        u3 = torch.max(sent, 2)[0]
+
+        sent = self.convnet4(sent)
+        u4 = torch.max(sent, 2)[0]
+
+        emb = torch.cat((u1, u2, u3, u4), 1)
+
+        return emb
+
+
+"""
+Normal ConvNet
+"""
+
+
+class NormalConvNetEncoder(nn.Module):
+    def __init__(self, config):
+        super(NormalConvNetEncoder, self).__init__()
+        self.word_emb_dim = config['word_emb_dim']
+        self.enc_lstm_dim = config['enc_lstm_dim']
+        self.conv = nn.Conv2d(in_channels=1, out_channels=self.enc_lstm_dim, kernel_size=(3, self.word_emb_dim),
+                              stride=(1, self.word_emb_dim))
+
+    def encode(self, inputs):
+        output = inputs.transpose(0, 1).unsqueeze(1)  # [batch_size, in_kernel, seq_length, embed_dim]
+        output = F.relu(self.conv(output))  # conv -> [batch_size, out_kernel, seq_length, 1]
+        output = output.squeeze(3).max(2)[0]  # max_pool -> [batch_size, out_kernel]
+        return output
+
+    def forward(self, sent_tuple):
+        # sent_len: [max_len, ..., min_len] (batch)
+        # sent: Variable(seqlen x batch x worddim)
+        sent, sent_len = sent_tuple
+        emb = self.encode(sent)
+        return emb
+
+
+"""
+https://github.com/Shawn1993/cnn-text-classification-pytorch/blob/master/model.py
+352 stars
+"""
+
+
+class CNN_Text_Encoder(nn.Module):
+    def __init__(self, config):
+        super(CNN_Text_Encoder, self).__init__()
+
+        self.word_emb_dim = config['word_emb_dim']
+
+        # V = args.embed_num
+        # D = args.embed_dim
+        # C = args.class_num
+        Ci = 1
+        Co = config['kernel_num']  # 100
+        Ks = config['kernel_sizes']  # '3,4,5'
+        # len(Ks)*Co
+
+        # self.convs1 = [nn.Conv2d(Ci, Co, (K, D)) for K in Ks]
+        self.convs1 = nn.ModuleList([nn.Conv2d(Ci, Co, (K, self.word_emb_dim)) for K in Ks])
+        '''
+        self.conv13 = nn.Conv2d(Ci, Co, (3, D))
+        self.conv14 = nn.Conv2d(Ci, Co, (4, D))
+        self.conv15 = nn.Conv2d(Ci, Co, (5, D))
+        '''
+        # self.dropout = nn.Dropout(args.dropout)
+        # self.fc1 = nn.Linear(len(Ks) * Co, C)
+
+    def conv_and_pool(self, x, conv):
+        x = F.relu(conv(x)).squeeze(3)  # (N, Co, W)
+        x = F.max_pool1d(x, x.size(2)).squeeze(2)
+        return x
+
+    def forward(self, x):
+        # x = self.embed(x)  # (N, W, D)
+
+        x = x[0].transpose(0, 1).unsqueeze(1)
+        # x = x.unsqueeze(1)  # (N, Ci, W, D)
+
+        x = [F.relu(conv(x)).squeeze(3) for conv in self.convs1]  # [(N, Co, W), ...]*len(Ks)
+
+        x = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in x]  # [(N, Co), ...]*len(Ks)
+
+        x = torch.cat(x, 1)
+
+        '''
+        x1 = self.conv_and_pool(x,self.conv13) #(N,Co)
+        x2 = self.conv_and_pool(x,self.conv14) #(N,Co)
+        x3 = self.conv_and_pool(x,self.conv15) #(N,Co)
+        x = torch.cat((x1, x2, x3), 1) # (N,len(Ks)*Co)
+        '''
+        # x = self.dropout(x)  # (N, len(Ks)*Co)
+        # logit = self.fc1(x)  # (N, C)
+        return x
+
 
 class Classifier(nn.Module):
     def __init__(self, vocab, config):
         super(Classifier, self).__init__()
         self.config = config
         self.drop = nn.Dropout(config.dropout)  # embedding dropout
-        
-        self.encoder = nn.LSTM(
-            config.emb_dim,
-            config.hidden_size,
-            config.depth,
-            dropout=config.dropout,
-            bidirectional=config.bidir)  # ha...not even bidirectional
-        d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
+        if config.conv_enc == 1:
+            kernel_size = config.hidden_size / 8
+            print(kernel_size)
+            self.encoder = ConvNetEncoder({
+                'word_emb_dim': config.emb_dim,
+                'enc_lstm_dim': kernel_size if not config.bidir else kernel_size * 2
+            })
+            d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
+        elif config.conv_enc == 2:
+            kernel_size = config.hidden_size
+            print(kernel_size)
+            self.encoder = NormalConvNetEncoder({
+                'word_emb_dim': config.emb_dim,
+                'enc_lstm_dim': kernel_size if not config.bidir else kernel_size * 2
+            })
+            d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
+        elif config.conv_enc == 3:
+            kernel_num = config.hidden_size / 3
+            kernel_num = kernel_num if not config.bidir else kernel_num * 2
+            self.encoder = CNN_Text_Encoder({
+                'word_emb_dim': config.emb_dim,
+                'kernel_sizes': [3, 4, 5],
+                'kernel_num': kernel_num
+            })
+            d_out = len([3, 4, 5]) * kernel_num
+        else:
+            self.encoder = nn.LSTM(
+                config.emb_dim,
+                config.hidden_size,
+                config.depth,
+                dropout=config.dropout,
+                bidirectional=config.bidir)  # ha...not even bidirectional
+            d_out = config.hidden_size if not config.bidir else config.hidden_size * 2
 
         self.out = nn.Linear(d_out, config.label_size)  # include bias, to prevent bias assignment
         self.embed = nn.Embedding(len(vocab), config.emb_dim)
@@ -187,6 +390,364 @@ class Classifier(nn.Module):
 
     def get_softmax_weight(self):
         return self.out.weight
+
+
+"""
+Interpretation module
+"""
+
+
+def propagate_three(a, b, c, activation):
+    a_contrib = 0.5 * (activation(a + c) - activation(c) +
+                       activation(a + b + c) - activation(b + c))
+    b_contrib = 0.5 * (activation(b + c) - activation(c) +
+                       activation(a + b + c) - activation(a + c))
+    return a_contrib, b_contrib, activation(c)
+
+
+# propagate tanh nonlinearity
+def propagate_tanh_two(a, b):
+    return 0.5 * (np.tanh(a) + (np.tanh(a + b) - np.tanh(b))), 0.5 * (np.tanh(b) + (np.tanh(a + b) - np.tanh(a)))
+
+
+def propagate_max_two(a, b, d=0):
+    # need to return a, b with the same shape...
+    indices = np.argmax(a + b, axis=d)
+    a_mask = np.zeros_like(a)
+    a_mask[indices, np.arange(a.shape[1])] = 1
+    a = a * a_mask
+
+    b_mask = np.zeros_like(b)
+    b_mask[indices, np.arange(b.shape[1])] = 1
+    b = b * b_mask
+
+    return a, b
+
+
+class BaseLSTM(object):
+    def __init__(self, model, bilstm=False):
+        self.model = model
+        weights = model.encoder.state_dict()
+
+        self.optimizer = torch.optim.SGD(self.model.parameters(), 0.1)
+
+        self.hidden_dim = model.config.hidden_size
+
+        self.W_ii, self.W_if, self.W_ig, self.W_io = np.split(
+            weights['weight_ih_l0'], 4, 0)
+        self.W_hi, self.W_hf, self.W_hg, self.W_ho = np.split(
+            weights['weight_hh_l0'], 4, 0)
+        self.b_i, self.b_f, self.b_g, self.b_o = np.split(
+            weights['bias_ih_l0'].numpy() + weights['bias_hh_l0'].numpy(),
+            4)
+
+        if bilstm:
+            self.rev_W_ii, self.rev_W_if, self.rev_W_ig, self.rev_W_io = np.split(
+                weights['weight_ih_l0_reverse'], 4, 0)
+            self.rev_W_hi, self.rev_W_hf, self.rev_W_hg, self.rev_W_ho = np.split(
+                weights['weight_hh_l0_reverse'], 4, 0)
+            self.rev_b_i, self.rev_b_f, self.rev_b_g, self.rev_b_o = np.split(
+                weights['bias_ih_l0_reverse'].numpy(
+                ) + weights['bias_hh_l0_reverse'].numpy(),
+                4)
+
+        self.word_emb_dim = 100
+
+        self.classifiers = [
+            (self.model.out.weight.data.numpy(),
+             self.model.out.bias.data.numpy())
+        ]
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+    def classify(self, final_res):
+        # note that u, v could be positional!! don't mix the two
+        for c in self.classifiers:
+            w, b = c
+            final_res = np.dot(w, final_res) + b
+        return final_res
+
+
+class MaxPoolingCDBiLSTM(BaseLSTM):
+    def cell(self, prev_h, prev_c, x_i):
+        # x_i = word_vecs[i]
+        rel_i = np.dot(self.W_hi, prev_h)
+        rel_g = np.dot(self.W_hg, prev_h)
+        rel_f = np.dot(self.W_hf, prev_h)
+        rel_o = np.dot(self.W_ho, prev_h)
+
+        rel_i = sigmoid(rel_i + np.dot(self.W_ii, x_i) + self.b_i)
+        rel_g = np.tanh(rel_g + np.dot(self.W_ig, x_i) + self.b_g)
+        rel_f = sigmoid(rel_f + np.dot(self.W_if, x_i) + self.b_f)
+        rel_o = sigmoid(rel_o + np.dot(self.W_io, x_i) + self.b_o)
+
+        c_t = rel_f * prev_c + rel_i * rel_g
+        h_t = rel_o * np.tanh(c_t)
+
+        return h_t, c_t
+
+    def rev_cell(self, prev_h, prev_c, x_i):
+        # x_i = word_vecs[i]
+        rel_i = np.dot(self.rev_W_hi, prev_h)
+        rel_g = np.dot(self.rev_W_hg, prev_h)
+        rel_f = np.dot(self.rev_W_hf, prev_h)
+        rel_o = np.dot(self.rev_W_ho, prev_h)
+
+        rel_i = sigmoid(rel_i + np.dot(self.rev_W_ii, x_i) + self.rev_b_i)
+        rel_g = np.tanh(rel_g + np.dot(self.rev_W_ig, x_i) + self.rev_b_g)
+        rel_f = sigmoid(rel_f + np.dot(self.rev_W_if, x_i) + self.rev_b_f)
+        rel_o = sigmoid(rel_o + np.dot(self.rev_W_io, x_i) + self.rev_b_o)
+
+        c_t = rel_f * prev_c + rel_i * rel_g
+        h_t = rel_o * np.tanh(c_t)
+
+        return h_t, c_t
+
+    def run_bi_lstm(self, sent):
+        # this is used as validation
+        # sent: [legnth, dim=100]
+        word_vecs = sent
+
+        T = word_vecs.shape[0]
+
+        hidden_states = np.zeros((T, self.hidden_dim))
+        rev_hidden_states = np.zeros((T, self.hidden_dim))
+
+        cell_states = np.zeros((T, self.hidden_dim))
+        rev_cell_states = np.zeros((T, self.hidden_dim))
+
+        for i in range(T):
+            if i > 0:
+                # this is just the prev hidden state
+                prev_h = hidden_states[i - 1]
+                prev_c = cell_states[i - 1]
+            else:
+                prev_h = np.zeros(self.hidden_dim)
+                prev_c = np.zeros(self.hidden_dim)
+
+            new_h, new_c = self.cell(prev_h, prev_c, word_vecs[i])
+
+            hidden_states[i] = new_h
+            cell_states[i] = new_c
+
+        for i in reversed(range(T)):
+            # 20, 19, 18, 17, ...
+            if i < T - 1:
+                # this is just the prev hidden state
+                prev_h = rev_hidden_states[i + 1]
+                prev_c = rev_cell_states[i + 1]
+            else:
+                prev_h = np.zeros(self.hidden_dim)
+                prev_c = np.zeros(self.hidden_dim)
+
+            new_h, new_c = self.rev_cell(prev_h, prev_c, word_vecs[i])
+
+            rev_hidden_states[i] = new_h
+            rev_cell_states[i] = new_c
+
+        # stack second dimension
+        return np.hstack([hidden_states, rev_hidden_states]), np.hstack([cell_states, rev_cell_states])
+
+    def get_word_level_scores(self, sentence, sentence_len, label_idx):
+        """
+        :param sentence: word embeddings of [T, d]
+        :return:
+        """
+        # texts = gen_tiles(text_orig, method='cd', sweep_dim=1).transpose()
+        # starts, stops = tiles_to_cd(texts)
+        # [0, 1, 2,...], [0, 1, 2,...]
+
+        self.zero_grad()
+
+        # contextual decomposition
+        rel_A, irrel_A = self.cd_encode(sentence)  # already masked
+
+        # Gradient part!
+        # now we actually fire up the encoder, and get gradients w.r.t. hidden states
+        # run the actual model to compute gradients
+        sentence_emb = self.model.embed(sentence)
+        lengths = sentence_len.view(-1).tolist()
+
+        output, hidden = self.model.encoder(sentence_emb)
+        # output_vec = unpack(output)[0]
+        sent_output = torch.max(output, 0)[0].squeeze(0)
+        clf_output = self.model.out(sent_output)
+        # output_vec is the hidden states we want!! (T, hid_state_dim)
+
+        # TODO: fix this part
+        # y = clf_output[label_idx]
+        # label_id = torch.max(clf_output, 0)[1]
+
+        # compute A score
+        y = clf_output[label_idx]
+        grad = torch.autograd.grad(y, output, retain_graph=True)[0]
+
+        scores_A = grad.data.squeeze() * torch.from_numpy(rel_A).float()
+
+        # (sent_len, num_label)
+        return scores_A.sum(dim=1), clf_output
+
+    def extract_keywords(self, sentence, sentence_len, dataset, score_values, label_keyword_dict, label_size=42, threshold=0.2):
+        # sentence: x
+        # sentence_len: x_len
+        # text_score_tup_list: [('surgery', 4.0), ...]
+
+        self.zero_grad()
+
+        # contextual decomposition
+        rel_A, irrel_A = self.cd_encode(sentence)  # already masked
+
+        # Gradient part!
+        # now we actually fire up the encoder, and get gradients w.r.t. hidden states
+        # run the actual model to compute gradients
+        sentence_emb = self.model.embed(sentence)
+        lengths = sentence_len.view(-1).tolist()
+        # packed_emb = nn.utils.rnn.pack_padded_sequence(sentence_emb, lengths)
+        # output, hidden = self.model.encoder(packed_emb)
+        output, hidden = self.model.encoder(sentence_emb)
+        # output_vec = unpack(output)[0]
+        sent_output = torch.max(output, 0)[0].squeeze(0)
+        clf_output = self.model.out(sent_output)
+        # output_vec is the hidden states we want!! (T, hid_state_dim)
+
+        # y = clf_output[label_idx]
+        # label_id = torch.max(clf_output, 0)[1]
+
+        text = [dataset.TEXT.vocab.itos[idx] for idx in sentence.data]
+
+        # compute A score
+        for label_idx in range(label_size):
+            self.zero_grad()
+
+            y = clf_output[label_idx]
+            grad = torch.autograd.grad(y, output, retain_graph=True)[0]
+
+            scores_A = grad.data.squeeze() * torch.from_numpy(rel_A).float()
+            scores_A = scores_A.sum(dim=1).data.squeeze().numpy().tolist()
+
+            assert len(scores_A) == len(text)
+
+            score_values.extend(scores_A)
+
+            for g, t in zip(scores_A, text):
+                if g > threshold:
+                    label_keyword_dict[label_idx].append(t)
+
+        # we don't return anything :)
+        return
+
+    def cd_encode(self, sentences):
+        rel_h, irrel_h, _ = self.flat_cd_text(sentences)
+        rev_rel_h, rev_irrel_h, _ = self.flat_cd_text(sentences, reverse=True)
+        rel = np.hstack([rel_h, rev_rel_h])  # T, 2*d
+        irrel = np.hstack([irrel_h, rev_irrel_h])  # T, 2*d
+        # again, hidden-states = rel + irrel
+
+        # we mask both
+        rel_masked, irrel_masked = propagate_max_two(rel, irrel)
+
+        # (2*d), actual sentence representation
+        return rel_masked, irrel_masked
+
+    def flat_cd_text(self, sentence, reverse=False):
+        # collects relevance for word 0 to sent_length
+        # not considering interactions between words; merely collecting word contribution
+
+        # word_vecs = self.model.embed(batch.text)[:, 0].data
+        word_vecs = self.model.embed(sentence).squeeze().data.numpy()
+
+        T = word_vecs.shape[0]
+
+        # so prev_h is always irrelevant
+        # there's no rel_h because we only look at each time step individually
+
+        # relevant cell states, irrelevant cell states
+        relevant = np.zeros((T, self.hidden_dim))
+        irrelevant = np.zeros((T, self.hidden_dim))
+
+        relevant_h = np.zeros((T, self.hidden_dim))
+        # keep track of the entire hidden state
+        irrelevant_h = np.zeros((T, self.hidden_dim))
+
+        hidden_states = np.zeros((T, self.hidden_dim))
+        cell_states = np.zeros((T, self.hidden_dim))
+
+        if not reverse:
+            W_ii, W_if, W_ig, W_io = self.W_ii, self.W_if, self.W_ig, self.W_io
+            W_hi, W_hf, W_hg, W_ho = self.W_hi, self.W_hf, self.W_hg, self.W_ho
+            b_i, b_f, b_g, b_o = self.b_i, self.b_f, self.b_g, self.b_o
+        else:
+            W_ii, W_if, W_ig, W_io = self.rev_W_ii, self.rev_W_if, self.rev_W_ig, self.rev_W_io
+            W_hi, W_hf, W_hg, W_ho = self.rev_W_hi, self.rev_W_hf, self.rev_W_hg, self.rev_W_ho
+            b_i, b_f, b_g, b_o = self.rev_b_i, self.rev_b_f, self.rev_b_g, self.rev_b_o
+
+        # strategy: keep using prev_h as irrel_h
+        # every time, make sure h = irrel + rel, then prev_h = h
+
+        indices = range(T) if not reverse else reversed(range(T))
+        for i in indices:
+            first_cond = i > 0 if not reverse else i < T - 1
+            if first_cond:
+                ret_idx = i - 1 if not reverse else i + 1
+                prev_c = cell_states[ret_idx]
+                prev_h = hidden_states[ret_idx]
+            else:
+                prev_c = np.zeros(self.hidden_dim)
+                prev_h = np.zeros(self.hidden_dim)
+
+            irrel_i = np.dot(W_hi, prev_h)
+            irrel_g = np.dot(W_hg, prev_h)
+            irrel_f = np.dot(W_hf, prev_h)
+            irrel_o = np.dot(W_ho, prev_h)
+
+            rel_i = np.dot(W_ii, word_vecs[i])
+            rel_g = np.dot(W_ig, word_vecs[i])
+            rel_f = np.dot(W_if, word_vecs[i])
+            rel_o = np.dot(W_io, word_vecs[i])
+
+            # this remains unchanged
+            rel_contrib_i, irrel_contrib_i, bias_contrib_i = propagate_three(
+                rel_i, irrel_i, b_i, sigmoid)
+            rel_contrib_g, irrel_contrib_g, bias_contrib_g = propagate_three(
+                rel_g, irrel_g, b_g, np.tanh)
+
+            relevant[i] = rel_contrib_i * (rel_contrib_g + bias_contrib_g) + \
+                          bias_contrib_i * rel_contrib_g
+            irrelevant[i] = irrel_contrib_i * (rel_contrib_g + irrel_contrib_g + bias_contrib_g) + \
+                            (rel_contrib_i + bias_contrib_i) * irrel_contrib_g
+
+            relevant[i] += bias_contrib_i * bias_contrib_g
+            # if i >= start and i < stop:
+            #     relevant[i] += bias_contrib_i * bias_contrib_g
+            # else:
+            #     irrelevant[i] += bias_contrib_i * bias_contrib_g
+
+            cond = i > 0 if not reverse else i < T - 1
+            if cond:
+                rel_contrib_f, irrel_contrib_f, bias_contrib_f = propagate_three(
+                    rel_f, irrel_f, b_f, sigmoid)
+
+                # not sure if this is completely correct
+                irrelevant[i] += (rel_contrib_f +
+                                  irrel_contrib_f + bias_contrib_f) * prev_c
+
+            # recompute o-gate
+            o = sigmoid(rel_o + irrel_o + b_o)
+            rel_contrib_o, irrel_contrib_o, bias_contrib_o = propagate_three(
+                rel_o, irrel_o, b_o, sigmoid)
+            # from current cell state
+            new_rel_h, new_irrel_h = propagate_tanh_two(
+                relevant[i], irrelevant[i])
+            # relevant_h[i] = new_rel_h * (rel_contrib_o + bias_contrib_o)
+            # irrelevant_h[i] = new_rel_h * (irrel_contrib_o) + new_irrel_h * (rel_contrib_o + irrel_contrib_o + bias_contrib_o)
+            relevant_h[i] = o * new_rel_h
+            irrelevant_h[i] = o * new_irrel_h
+
+            hidden_states[i] = relevant_h[i] + irrelevant_h[i]
+            cell_states[i] = relevant[i] + irrelevant[i]
+
+        return relevant_h, irrelevant_h, hidden_states
 
 
 # this dataset can also take in 5-class classification
@@ -366,6 +927,93 @@ class MetaLoss(nn.Module):
         return meta_loss
 
 
+def log_of_array_ignoring_zeros(M):
+    """Returns an array containing the logs of the nonzero
+    elements of M. Zeros are left alone since log(0) isn't
+    defined.
+    """
+    log_M = M.copy()
+    mask = log_M > 0
+    log_M[mask] = np.log(log_M[mask])
+    return log_M
+
+
+def observed_over_expected(df):
+    col_totals = df.sum(axis=0)
+    total = col_totals.sum()
+    row_totals = df.sum(axis=1)
+    expected = np.outer(row_totals, col_totals) / total
+    oe = df / expected
+    return oe
+
+
+def pmi(df, positive=True):
+    df = observed_over_expected(df)
+    # Silence distracting warnings about log(0):
+    with np.errstate(divide='ignore'):
+        df = np.log(df)
+    df[np.isnan(df)] = 0.0  # log(0) = 0
+    if positive:
+        df[df < 0] = 0.0
+    return df
+
+
+class CoOccurenceLoss(nn.Module):
+    def __init__(self, config,
+                 csu_path='./data/csu/label_co_matrix.npy',
+                 pp_path='./data/csu/pp_combined_label_co_matrix.npy',
+                 device=-1):
+        super(CoOccurenceLoss, self).__init__()
+        self.co_mat_path = csu_path if config.use_csu else pp_path
+        self.co_mat = np.load(self.co_mat_path)
+        self.X = self.co_mat
+        self.glove = self.config.glove
+
+        logging.info("using co_matrix {}".format(self.co_mat_path))
+        self.n = config.hidden_size  # N-dim rep
+        self.m = config.label_size
+
+        self.gamma = self.config.gamma
+        if self.glove:
+            self.C = torch.empty(self.m, self.n)
+            self.C = Variable(self.C.uniform_(-0.5, 0.5)).cuda(device)
+            self.B = torch.empty(2, self.m)
+            self.B = Variable(self.B.uniform_(-0.5, 0.5)).cuda(device)
+
+            self.indices = list(range(self.m))  # label_size
+
+            # Precomputable GloVe values:
+            self.X_log = log_of_array_ignoring_zeros(self.X)
+            self.X_weights = (np.minimum(self.X, config.xmax) / config.xmax) ** config.alpha  # eq. (9)
+
+            # iterate on the upper triangular matrix, off-diagonal
+            self.iu1 = np.triu_indices(41, 1)  # 820 iterations
+        else:
+            self.X = Variable(pmi(self.X, positive=self.config.ppmi), requires_grad=False).cuda(device)
+            self.mse = nn.MSELoss()
+
+    def forward(self, softmax_weight):
+        # this computes a straight-through pass of the GloVE objective
+        # similar to "Auxiliary" training
+        # return the loss
+        # softmax_weight: [d, |Y|]
+        if self.glove:
+            loss = 0.
+            for i, j in zip(self.iu1[0], self.iu1[1]):
+                if self.X[i, j] > 0.0:
+                    # Cost is J' based on eq. (8) in the paper:
+                    # (1, |Y|) dot (1, |Y|)
+                    diff = softmax_weight[:, i].dot(self.C[j]) + self.B[0, i] + self.B[1, j] - self.X_log[i, j]
+                    loss += self.X_weights[i, j] * diff  # f(X_ij) * (w_i w_j + b_i + b_j - log X_ij)
+                    # this is the summation, not average
+        else:
+            # softmax_weight: (d, m)
+            # (m, d) (d, m)
+            a = torch.matmul(torch.transpose(softmax_weight, 1, 0), softmax_weight)
+            loss = self.mse(a, self.X)
+        return loss * self.gamma
+
+
 # maybe we should evaluate inside this
 # currently each Trainer is tied to one GPU, so we don't have to worry about
 # Each trainer is associated with a config and classifier actually...so should be associated with a log
@@ -383,6 +1031,9 @@ class Trainer(object):
                 self.classifier = torch.load(pjoin(save_path, 'model.pickle')).cuda(device)
         else:
             self.classifier = classifier.cuda(device)
+
+        # replace old cached config with new config
+        self.classifier.config = config
 
         self.dataset = dataset
         self.device = device
@@ -559,12 +1210,12 @@ class Trainer(object):
         return error_dict
 
     def evaluate(self, is_test=False, is_external=False, silent=False, return_by_label_stats=False,
-                 return_instances=False):
+                 return_instances=False, return_roc_auc=False):
         self.classifier.eval()
         data_iter = self.test_iter if is_test else self.val_iter  # evaluate on CSU
         data_iter = self.external_test_iter if is_external else data_iter  # evaluate on adobe
 
-        all_preds, all_y_labels = [], []
+        all_preds, all_y_labels, all_confs = [], [], []
 
         for iter, data in enumerate(data_iter):
             (x, x_lengths), y = data.Text, data.Description
@@ -573,9 +1224,11 @@ class Trainer(object):
             preds = (torch.sigmoid(logits) > 0.5).data.cpu().numpy().astype(float)
             all_preds.append(preds)
             all_y_labels.append(y.data.cpu().numpy())
+            all_confs.append(torch.sigmoid(logits).data.cpu().numpy().astype(float))
 
         preds = np.vstack(all_preds)
         ys = np.vstack(all_y_labels)
+        confs = np.vstack(all_confs)
 
         if not silent:
             self.logger.info("\n" + metrics.classification_report(ys, preds, digits=3))  # write to file
@@ -586,10 +1239,26 @@ class Trainer(object):
                         dtype='float32')
         p, r, f1, s = metrics.precision_recall_fscore_support(ys, preds, average=None)
 
-        if return_by_label_stats:
+        # because some labels are NOT present in the test set, we need to message this function
+        # filter out labels that have no examples
+
+        # this code works :)
+        roc_auc = np.zeros(ys.shape[1])
+        roc_auc[:] = 0.5  # base value for ROC AUC
+        non_zero_label_idices = ys.sum(0).nonzero()
+
+        non_zero_ys = np.squeeze(ys[:, non_zero_label_idices])
+        non_zero_preds = np.squeeze(preds[:, non_zero_label_idices])
+        non_zero_roc_auc = metrics.roc_auc_score(non_zero_ys, non_zero_preds, average=None)
+
+        roc_auc[non_zero_label_idices] = non_zero_roc_auc
+
+        if return_by_label_stats and return_roc_auc:
+            return p, r, f1, s, accu, roc_auc
+        elif return_by_label_stats:
             return p, r, f1, s, accu
         elif return_instances:
-            return ys, preds
+            return ys, preds, confs
 
         micro_p, micro_r, micro_f1 = np.average(p, weights=s), np.average(r, weights=s), np.average(f1, weights=s)
 
@@ -1140,28 +1809,30 @@ class Experiment(object):
         if rebuild_vocab:
             self.dataset.build_vocab(config, True)
 
-        agg_p, agg_r, agg_f1, agg_accu = 0., 0., 0., 0.
+        agg_p, agg_r, agg_f1, agg_accu, agg_roc_auc = 0., 0., 0., 0., 0.
         agg_f1_list = []
 
         for run_order in range(config.avg_run_times):
             if not silent:
                 print("Executing order {}".format(run_order))
             trainer = self.get_trainer(config, device, run_order, build_vocab=False, load=True)
-            p, r, f1, s, accu = trainer.evaluate(is_test=True, is_external=is_external, return_by_label_stats=True,
-                                                 silent=True)
+            p, r, f1, s, accu, roc_auc = trainer.evaluate(is_test=True, is_external=is_external, return_by_label_stats=True,
+                                                 silent=True, return_roc_auc=True)
             agg_p += p;
             agg_r += r;
             agg_f1 += f1;
-            agg_accu += accu
+            agg_accu += accu;
+            agg_roc_auc += roc_auc;
             agg_f1_list.append(f1)
 
         if return_f1_ci:
             return self.compute_label_metrics_ci(config, agg_f1_list)
 
-        agg_p, agg_r, agg_f1, agg_accu = agg_p / float(config.avg_run_times), agg_r / float(config.avg_run_times), \
-                                         agg_f1 / float(config.avg_run_times), agg_accu / float(config.avg_run_times)
+        agg_p, agg_r, agg_f1, agg_accu, agg_roc_auc = agg_p / float(config.avg_run_times), agg_r / float(config.avg_run_times), \
+                                                     agg_f1 / float(config.avg_run_times), agg_accu / float(config.avg_run_times), \
+                                                     agg_roc_auc / float(config.avg_run_times)
 
-        return agg_p, agg_r, agg_f1, agg_accu
+        return agg_p, agg_r, agg_f1, agg_accu, agg_roc_auc
 
     def get_performance(self, config):
         # actually looks into trainer's actual file
@@ -1190,19 +1861,21 @@ class Experiment(object):
 
 # Important! Each time you use "get_iterators", must restore previous random state
 # otherwise the sampling procedure will be different
-def run_baseline(device):
+def run_baseline(device, label_size):
     random.setstate(orig_state)
-    lstm_base_c = LSTMBaseConfig(emb_corpus=emb_corpus, avg_run_times=avg_run_times
-                                 )
+    lstm_base_c = LSTMBaseConfig(emb_corpus=emb_corpus, avg_run_times=avg_run_times,
+                                 label_size=label_size,
+                                 conv_enc=use_conv)
     curr_exp.execute(lstm_base_c, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=lstm_base_c, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
 
 
-def run_bidir_baseline(device):
+def run_bidir_baseline(device, label_size):
     random.setstate(orig_state)
-    lstm_bidir_c = LSTMBaseConfig(bidir=True, emb_corpus=emb_corpus, avg_run_times=avg_run_times
-                                  )
+    lstm_bidir_c = LSTMBaseConfig(bidir=True, emb_corpus=emb_corpus, avg_run_times=avg_run_times,
+                                  label_size=label_size,
+                                  conv_enc=use_conv)
     curr_exp.execute(lstm_bidir_c, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=lstm_bidir_c, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
@@ -1210,8 +1883,8 @@ def run_bidir_baseline(device):
 
 def run_m_penalty(device, beta=1e-3, bidir=False):
     random.setstate(orig_state)
-    config = LSTM_w_M_Config(beta, bidir=bidir, emb_corpus=emb_corpus, avg_run_times=avg_run_times
-                             )
+    config = LSTM_w_M_Config(beta, bidir=bidir, emb_corpus=emb_corpus, avg_run_times=avg_run_times,
+                             conv_enc=use_conv)
     curr_exp.execute(config, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=config, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
@@ -1220,10 +1893,11 @@ def run_m_penalty(device, beta=1e-3, bidir=False):
 def run_c_penalty(device, sigma_M, sigma_B, sigma_W, bidir=False):
     random.setstate(orig_state)
     config = LSTM_w_C_Config(sigma_M, sigma_B, sigma_W, bidir=bidir, emb_corpus=emb_corpus,
-                             avg_run_times=avg_run_times)
+                             avg_run_times=avg_run_times, conv_enc=use_conv)
     curr_exp.execute(config, train_epochs=train_epochs, device=device)
     # trainer = curr_exp.get_trainer(config=config, device=device, build_vocab=True)
     # curr_exp.execute(trainer=trainer)
+
 
 use_conv = 0
 
@@ -1252,8 +1926,11 @@ if __name__ == '__main__':
 
     dataset_number = raw_input("enter dataset name prefix id (1=snomed_multi_label_no_des_ \n "
                                "2=snomed_revised_fields_multi_label_no_des_ \n"
-                               "3=snomed_all_fields_multi_label_no_des_): \n")
+                               "3=snomed_all_fields_multi_label_no_des_\n"
+                               "4=snomed_fine_grained_multi_label_no_des_): \n")
 
+    label_size = 42
+    test_data_name = 'adobe_combined_abbr_matched_snomed_multi_label_no_des_test.tsv'
     if dataset_number.strip() == "":
         print("Default choice to 1")
         dataset_prefix = 'snomed_multi_label_no_des_'
@@ -1263,6 +1940,16 @@ if __name__ == '__main__':
         dataset_prefix = 'snomed_revised_fields_multi_label_no_des_'
     elif int(dataset_number) == 3:
         dataset_prefix = 'snomed_all_fields_multi_label_no_des_'
+    elif int(dataset_number) == 4:
+        dataset_prefix = 'snomed_fine_grained_multi_label_no_des_'
+        label_size = 4577
+        test_data_name = 'adobe_combined_abbr_matched_snomed_fine_grained_label_no_des_test.tsv'
+
+    conv_encoder = raw_input("Use conv_encoder or not? 0/1(Hierarchical)/2(Normal)/3(TextCNN) \n")
+    assert (conv_encoder == '0' or conv_encoder == '1' or conv_encoder == '2' or conv_encoder == '3')
+
+    global use_conv
+    use_conv = int(conv_encoder.strip())
 
     train_epochs = raw_input("Enter the number of training epochs: (default 5) \n")
     if train_epochs.strip() == "":
@@ -1271,7 +1958,7 @@ if __name__ == '__main__':
         train_epochs = int(train_epochs.strip())
 
     print("loading in dataset...will take 3-4 minutes...")
-    dataset = Dataset(dataset_prefix=dataset_prefix)
+    dataset = Dataset(dataset_prefix=dataset_prefix, label_size=label_size, test_data_name=test_data_name)
 
     curr_exp = Experiment(dataset=dataset, exp_save_path='./{}/'.format(exp_name))
 
@@ -1281,8 +1968,8 @@ if __name__ == '__main__':
         IPython.embed()
     elif action == 'baseline':
         # baseline LSTM
-        run_baseline(device_num)
-        run_bidir_baseline(device_num)
+        run_baseline(device_num, label_size)
+        run_bidir_baseline(device_num, label_size)
     elif action == 'meta':
         # baseline LSTM + M
         # run_m_penalty(device_num, beta=1e-3)
@@ -1292,6 +1979,7 @@ if __name__ == '__main__':
         # run_bidir_baseline(device_num)
         #
         # # baseline LSTM + M + bidir
+        assert 'fine_grained' not in dataset_prefix
         run_m_penalty(device_num, beta=1e-4, bidir=True)
         run_m_penalty(device_num, beta=1e-3, bidir=True)
         #
@@ -1305,6 +1993,7 @@ if __name__ == '__main__':
         # run_c_penalty(device_num, sigma_M=1e-4, sigma_B=1e-3, sigma_W=1e-3)
 
     elif action == 'cluster':
+        assert 'fine_grained' not in dataset_prefix
         # baseline LSTM + C
         run_c_penalty(device_num, sigma_M=1e-5, sigma_B=1e-4, sigma_W=1e-4)
         run_c_penalty(device_num, sigma_M=1e-4, sigma_B=1e-3, sigma_W=1e-3)
